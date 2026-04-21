@@ -5,7 +5,13 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets
 from envs.ogbench_utils import make_ogbench_env_and_datasets
-from envs.robomimic_utils import is_robomimic_env
+# from envs.robomimic_utils import is_robomimic_env
+def is_robomimic_env(env_name):
+    """determine if an env is robomimic"""
+    if "low_dim" not in env_name:
+        return False
+    task, dataset_type, hdf5_type = env_name.split("-")
+    return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph")
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -65,7 +71,8 @@ class LoggingHelper:
         self.wandb_logger.log({f'{prefix}/{k}': v for k, v in data.items()}, step=step)
 
 def main(_):
-    exp_name = get_exp_name(FLAGS.seed)
+    # exp_name = get_exp_name(FLAGS.seed)
+    exp_name = FLAGS.agent.agent_name + '_' + get_exp_name(FLAGS.seed) + '_' + FLAGS.env_name
     run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
     
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)

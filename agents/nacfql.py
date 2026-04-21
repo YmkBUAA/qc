@@ -95,9 +95,13 @@ class NACFQLAgent(flax.struct.PyTreeNode):
         }
 
     # ------------------------------------------------------------------
-    # Value loss — V(s_0) as MC estimate of E_{a ~ pi}[Q_tgt(s_0, a)],
-    # policy samples from the distilled one-step flow, target is the
-    # target critic for stability.
+    # Value loss — V(s_0) as MC estimate of E_{a ~ pi}[Q_tgt(s_0, a)].
+    #   * distill-ddpg: sample from the distilled one-step flow (fast).
+    #   * best-of-n:    sample from the BC flow (actor_onestep_flow is
+    #                   not trained). The V head then represents
+    #                   E_{a ~ BC}[Q_tgt], which is the baseline the
+    #                   V-anchor pins Q_n to at t=0.
+    # Target is the target critic for stability.
     # ------------------------------------------------------------------
     def value_loss(self, batch, grad_params, rng):
         obs = batch['observations']
@@ -111,7 +115,11 @@ class NACFQLAgent(flax.struct.PyTreeNode):
         obs_flat = obs_exp.reshape((batch_size * n,) + obs_tail)
         noises_flat = noises.reshape(batch_size * n, full_action_dim)
 
-        a_samples = self.network.select('actor_onestep_flow')(obs_flat, noises_flat)
+        if self.config['actor_type'] == 'distill-ddpg':
+            a_samples = self.network.select('actor_onestep_flow')(obs_flat, noises_flat)
+        else:
+            # best-of-n: actor_onestep_flow isn't trained; use BC flow directly.
+            a_samples = self.compute_flow_actions(obs_flat, noises_flat)
         a_samples = jnp.clip(a_samples, -1, 1)
         a_samples = jax.lax.stop_gradient(a_samples)
 
@@ -254,27 +262,32 @@ class NACFQLAgent(flax.struct.PyTreeNode):
             per_sample_bc = jnp.mean((pred - vel) ** 2, axis=-1)
         bc_flow_loss = jnp.mean(bc_weights * per_sample_bc)
 
-        # Distill + Q on the one-step flow head (always trained so the V
-        # head has a fast sampler for its MC target).
-        rng, noise_rng = jax.random.split(rng)
-        noises = jax.random.normal(noise_rng, (batch_size, full_action_dim))
-        target_flow_actions = self.compute_flow_actions(
-            batch['observations'], noises=noises
-        )
-        actor_actions = self.network.select('actor_onestep_flow')(
-            batch['observations'], noises, params=grad_params
-        )
-        distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+        # Distill + Q only in distill-ddpg; best-of-n trains only the BC
+        # flow and selects actions via argmax-Q over N samples at inference.
+        if self.config['actor_type'] == 'distill-ddpg':
+            rng, noise_rng = jax.random.split(rng)
+            noises = jax.random.normal(noise_rng, (batch_size, full_action_dim))
+            target_flow_actions = self.compute_flow_actions(
+                batch['observations'], noises=noises
+            )
+            actor_actions = self.network.select('actor_onestep_flow')(
+                batch['observations'], noises, params=grad_params
+            )
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-        actor_actions_clip = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(
-            batch['observations'], actions=actor_actions_clip
-        )
-        q = jnp.mean(qs, axis=0)
-        q_loss = -q.mean()
-        if self.config['normalize_q_loss']:
-            lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
-            q_loss = lam * q_loss
+            actor_actions_clip = jnp.clip(actor_actions, -1, 1)
+            qs = self.network.select('critic')(
+                batch['observations'], actions=actor_actions_clip
+            )
+            q = jnp.mean(qs, axis=0)
+            q_loss = -q.mean()
+            if self.config['normalize_q_loss']:
+                lam = jax.lax.stop_gradient(1 / jnp.abs(q).mean())
+                q_loss = lam * q_loss
+        else:
+            distill_loss = jnp.zeros(())
+            q_loss = jnp.zeros(())
+            q = jnp.zeros(())
 
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
@@ -499,20 +512,51 @@ class NACFQLAgent(flax.struct.PyTreeNode):
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
 
     # ------------------------------------------------------------------
-    # Inference — distill-ddpg one-shot sampler (chunk-flat).
+    # Inference — distill-ddpg one-shot sampler OR best-of-n argmax-Q
+    # over BC flow samples (chunk-flat). Mirrors ACFQL.
     # ------------------------------------------------------------------
     @jax.jit
     def sample_actions(self, observations, rng=None):
         full_action_dim = self._full_action_dim()
-        noises = jax.random.normal(
-            rng,
-            (
-                *observations.shape[: -len(self.config['ob_dims'])],
-                full_action_dim,
-            ),
-        )
-        actions = self.network.select('actor_onestep_flow')(observations, noises)
-        actions = jnp.clip(actions, -1, 1)
+
+        if self.config['actor_type'] == 'distill-ddpg':
+            noises = jax.random.normal(
+                rng,
+                (
+                    *observations.shape[: -len(self.config['ob_dims'])],
+                    full_action_dim,
+                ),
+            )
+            actions = self.network.select('actor_onestep_flow')(observations, noises)
+            actions = jnp.clip(actions, -1, 1)
+
+        elif self.config['actor_type'] == 'best-of-n':
+            noises = jax.random.normal(
+                rng,
+                (
+                    *observations.shape[: -len(self.config['ob_dims'])],
+                    self.config['actor_num_samples'],
+                    full_action_dim,
+                ),
+            )
+            observations = jnp.repeat(
+                observations[..., None, :], self.config['actor_num_samples'], axis=-2
+            )
+            actions = self.compute_flow_actions(observations, noises)
+            actions = jnp.clip(actions, -1, 1)
+            if self.config['q_agg'] == 'mean':
+                q = self.network.select('critic')(observations, actions).mean(axis=0)
+            else:
+                q = self.network.select('critic')(observations, actions).min(axis=0)
+            indices = jnp.argmax(q, axis=-1)
+
+            bshape = indices.shape
+            indices = indices.reshape(-1)
+            bsize = len(indices)
+            actions = jnp.reshape(
+                actions, (-1, self.config['actor_num_samples'], full_action_dim)
+            )[jnp.arange(bsize), indices, :].reshape(bshape + (full_action_dim,))
+
         return actions
 
     @jax.jit
@@ -668,6 +712,8 @@ def get_config():
             encoder=ml_collections.config_dict.placeholder(str),
             horizon_length=ml_collections.config_dict.placeholder(int),
             action_chunking=True,
+            actor_type='best-of-n',  # 'distill-ddpg' or 'best-of-n'
+            actor_num_samples=32,       # for actor_type='best-of-n' only
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
