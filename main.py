@@ -12,6 +12,13 @@ def is_robomimic_env(env_name):
         return False
     task, dataset_type, hdf5_type = env_name.split("-")
     return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph")
+# from envs.robomimic_utils import is_robomimic_env
+def is_robomimic_env(env_name):
+    """determine if an env is robomimic"""
+    if "low_dim" not in env_name:
+        return False
+    task, dataset_type, hdf5_type = env_name.split("-")
+    return task in ("lift", "can", "square", "transport", "tool_hang") and dataset_type in ("mh", "ph")
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
