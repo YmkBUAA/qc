@@ -28,12 +28,16 @@ class NACFQL3Agent(flax.struct.PyTreeNode):
     by a phase indicator `online ∈ {0, 1}` supplied per batch. At the
     online boundary the weighting activates automatically.
 
+    The actor BC flow loss uses K sampled flow times per data action. Each
+    (x_t, t) point receives its own Q_n residual, ESS-targeted weight, trust
+    value, and per-time loss contribution.
+
     Phase flag contract: caller places `batch['online']` as a scalar
     jnp.float32 (0.0 offline, 1.0 online). If the key is absent, the
     agent defaults to `online=1.0` — matching NACFQL v2 behaviour so
     existing call sites that don't set the flag are unaffected.
 
-    All Recipe 1 + Recipe 6 details from v2 are retained unchanged.
+    Noised-critic and value-anchor training details from v2 are retained.
     """
 
     rng: Any
@@ -175,45 +179,64 @@ class NACFQL3Agent(flax.struct.PyTreeNode):
     # ------------------------------------------------------------------
     # Actor loss — v2 actor reweighting gated by `online` phase flag.
     # offline (online=0) -> c_gate forced to 0 -> bc_weights == 1 -> pure
-    # chunked ACFQL BC flow loss. online (online=1) -> identical to v2.
+    # chunked ACFQL BC flow loss. online (online=1) -> K-way per-time weighting.
     # ------------------------------------------------------------------
     def actor_loss(self, batch, grad_params, rng):
         batch_actions = self._flat_actions(batch)
         batch_size, full_action_dim = batch_actions.shape
         rng, x_rng, t_rng = jax.random.split(rng, 3)
+        k = self.config['n_actor_time_samples']
 
-        x_0 = jax.random.normal(x_rng, (batch_size, full_action_dim))
+        x_0 = jax.random.normal(x_rng, (batch_size, k, full_action_dim))
         x_1 = batch_actions
-        t = jax.random.uniform(t_rng, (batch_size, 1))
-        x_t = (1 - t) * x_0 + t * x_1
-        vel = x_1 - x_0
+        x_1_exp = x_1[:, None, :]
+        t = jax.random.uniform(t_rng, (batch_size, k, 1))
+        x_t = (1 - t) * x_0 + t * x_1_exp
+        vel = x_1_exp - x_0
 
         original_qs = self.network.select('critic')(
             batch['observations'], actions=batch_actions
         )
         original_q = jax.lax.stop_gradient(original_qs.mean(axis=0))
 
-        x_t_with_t = jnp.concatenate([x_t, t], axis=-1)
-        noised_qs = self.noised_network.select('noised_critic')(
-            batch['observations'], actions=jax.lax.stop_gradient(x_t_with_t)
+        obs_tail = batch['observations'].shape[1:]
+        obs_exp = jnp.broadcast_to(
+            batch['observations'][:, None], (batch_size, k) + obs_tail
         )
+        x_t_with_t = jnp.concatenate([x_t, t], axis=-1)
+        if self.config['encoder'] is not None:
+            obs_flat = obs_exp.reshape((batch_size * k,) + obs_tail)
+            actions_flat = x_t_with_t.reshape((batch_size * k, -1))
+            noised_qs_flat = self.noised_network.select('noised_critic')(
+                obs_flat,
+                actions=jax.lax.stop_gradient(actions_flat),
+            )
+            noised_qs = noised_qs_flat.reshape(
+                (noised_qs_flat.shape[0], batch_size, k)
+            )
+        else:
+            noised_qs = self.noised_network.select('noised_critic')(
+                obs_exp, actions=jax.lax.stop_gradient(x_t_with_t)
+            )
         noised_q = jax.lax.stop_gradient(noised_qs.mean(axis=0))
         noised_q_disagree = jax.lax.stop_gradient(
             jnp.abs(noised_qs[0] - noised_qs[1])
         )
 
-        a_local = original_q - noised_q
+        a_local = original_q[:, None] - noised_q
+        a_local_flat = a_local.reshape(-1)
 
-        a_med = jnp.median(a_local)
-        beta_mad = 1.4826 * jnp.median(jnp.abs(a_local - a_med))
+        a_med = jnp.median(a_local_flat)
+        beta_mad = 1.4826 * jnp.median(jnp.abs(a_local_flat - a_med))
         beta_mad = jnp.maximum(beta_mad, 1e-6)
-        a_norm = (a_local - a_med) / beta_mad
+        a_norm = (a_local_flat - a_med) / beta_mad
 
-        w_exp, tau_star, ess_achieved = self._ess_targeted_weights(
+        w_exp_flat, tau_star, ess_achieved = self._ess_targeted_weights(
             a_norm, jnp.asarray(self.config['ess_target'])
         )
+        w_exp = w_exp_flat.reshape(batch_size, k)
 
-        delta_med = jnp.maximum(jnp.median(noised_q_disagree), 1e-6)
+        delta_med = jnp.maximum(jnp.median(noised_q_disagree.reshape(-1)), 1e-6)
         trust = jnp.exp(-noised_q_disagree / delta_med)
 
         ema_valid = (self.noised_loss_ema >= 0) & (self.var_q_ema > 0)
@@ -248,18 +271,23 @@ class NACFQL3Agent(flax.struct.PyTreeNode):
         bc_weights = jax.lax.stop_gradient(bc_weights)
 
         pred = self.network.select('actor_bc_flow')(
-            batch['observations'], x_t, t, params=grad_params
+            obs_exp, x_t, t, params=grad_params
         )
 
         if self.config['action_chunking']:
             per_step_sq = jnp.reshape(
                 (pred - vel) ** 2,
-                (batch_size, self.config['horizon_length'], self.config['action_dim']),
-            ) * batch['valid'][..., None]
-            per_sample_bc = jnp.mean(per_step_sq, axis=(1, 2))
+                (
+                    batch_size,
+                    k,
+                    self.config['horizon_length'],
+                    self.config['action_dim'],
+                ),
+            ) * batch['valid'][:, None, :, None]
+            per_time_bc = jnp.mean(per_step_sq, axis=(2, 3))
         else:
-            per_sample_bc = jnp.mean((pred - vel) ** 2, axis=-1)
-        bc_flow_loss = jnp.mean(bc_weights * per_sample_bc)
+            per_time_bc = jnp.mean((pred - vel) ** 2, axis=-1)
+        bc_flow_loss = jnp.mean(bc_weights * per_time_bc)
 
         if self.config['actor_type'] == 'distill-ddpg':
             rng, noise_rng = jax.random.split(rng)
@@ -288,7 +316,7 @@ class NACFQL3Agent(flax.struct.PyTreeNode):
 
         actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
 
-        frac_suboptimal = jnp.mean(original_q < noised_q)
+        frac_suboptimal = jnp.mean(original_q[:, None] < noised_q)
 
         return actor_loss, {
             'actor_loss': actor_loss,
@@ -310,6 +338,7 @@ class NACFQL3Agent(flax.struct.PyTreeNode):
             'bc_weight_mean': bc_weights.mean(),
             'bc_weight_max': bc_weights.max(),
             'bc_weight_min': bc_weights.min(),
+            'n_actor_time_samples': jnp.asarray(k, dtype=jnp.float32),
             't_mean': t.mean(),
         }
 
@@ -747,7 +776,8 @@ def get_config():
             t_sampling='beta',
             t_beta_a=2.0,
             t_beta_b=2.0,
-            # ---- ESS-targeted BC weighting ----
+            # ---- K-way ESS-targeted BC weighting ----
+            n_actor_time_samples=1,
             ess_target=0.7,
             # ---- Dual R^2 reliability gate ----
             r2_target=0.75,
