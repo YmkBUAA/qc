@@ -777,7 +777,7 @@ def get_config():
             t_beta_a=2.0,
             t_beta_b=2.0,
             # ---- K-way ESS-targeted BC weighting ----
-            n_actor_time_samples=1,
+            n_actor_time_samples=4,
             ess_target=0.7,
             # ---- Dual R^2 reliability gate ----
             r2_target=0.75,
