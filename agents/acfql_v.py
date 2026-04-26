@@ -213,7 +213,16 @@ class ACFQLVAgent(flax.struct.PyTreeNode):
         )
         gate_critic = jnp.where(critic_valid, gate_critic, jnp.asarray(0.0))
 
-        bc_weights = 1.0 + gate_critic * (w_exp - 1.0)
+        online = jnp.asarray(
+            batch.get('online', jnp.asarray(0.0)), dtype=jnp.float32
+        )
+        offline_weighting = jnp.asarray(
+            0.0 if self.config['weighted_bc_online_only'] else 1.0,
+            dtype=jnp.float32,
+        )
+        weighting_active = jnp.maximum(online, offline_weighting)
+        gate_c = gate_critic * weighting_active
+        bc_weights = 1.0 + gate_c * (w_exp - 1.0)
         bc_weights = jax.lax.stop_gradient(bc_weights)
 
         obs_tail = batch['observations'].shape[1:]
@@ -283,7 +292,9 @@ class ACFQLVAgent(flax.struct.PyTreeNode):
             'tau_star': tau_star,
             'ess_achieved': ess_achieved,
             'gate_critic': gate_critic,
-            'gate_c': gate_critic,
+            'gate_c': gate_c,
+            'online_phase': online,
+            'weighting_active': weighting_active,
             'r2_critic': r2_critic,
             'bc_weight_mean': bc_weights.mean(),
             'bc_weight_max': bc_weights.max(),
@@ -557,6 +568,7 @@ def get_config():
             value_loss_weight=1.0,
             # ---- ESS-targeted BC weighting ----
             ess_target=0.7,
+            weighted_bc_online_only=False,  # If True, value weighting is active only during the online stage.
             # ---- Critic R^2 reliability gate ----
             r2_critic_target=0.5,
             gate_kappa_critic=0.05,
