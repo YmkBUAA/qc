@@ -195,7 +195,7 @@ def main(_):
 
         batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
 
-        if config['agent_name'] == 'nacfql_3':
+        if config['agent_name'] in ('acfql_v', 'nacfql_3', 'nacfql_4'):
             batch = {**batch, 'online': jax.numpy.asarray(0.0, dtype=jax.numpy.float32)}
 
         agent, offline_info = agent.update(batch)
@@ -306,7 +306,7 @@ def main(_):
             batch = jax.tree.map(lambda x: x.reshape((
                 FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
 
-            if config['agent_name'] == 'nacfql_3':
+            if config['agent_name'] in ('acfql_v', 'nacfql_3', 'nacfql_4'):
                 batch = {**batch, 'online': jax.numpy.ones((FLAGS.utd_ratio,), dtype=jax.numpy.float32)}
 
             agent, update_info["online_agent"] = agent.batch_update(batch)
