@@ -5,6 +5,7 @@ from agents.nacfql import NACFQLAgent
 from agents.nacfql_2 import NACFQL2Agent
 from agents.nacfql_3 import NACFQL3Agent
 from agents.nacfql_4 import NACFQL4Agent
+from agents.acfql_ar import ACFQLARAgent
 from agents.acfql_v import ACFQLVAgent
 
 agents = dict(
@@ -15,5 +16,6 @@ agents = dict(
     nacfql_2=NACFQL2Agent,
     nacfql_3=NACFQL3Agent,
     nacfql_4=NACFQL4Agent,
+    acfql_ar=ACFQLARAgent,
     acfql_v=ACFQLVAgent,
 )
