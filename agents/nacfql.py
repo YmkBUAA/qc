@@ -712,7 +712,7 @@ def get_config():
             encoder=ml_collections.config_dict.placeholder(str),
             horizon_length=ml_collections.config_dict.placeholder(int),
             action_chunking=True,
-            actor_type='distill-ddpg',  # 'distill-ddpg' or 'best-of-n'
+            actor_type='best-of-n',  # 'distill-ddpg' or 'best-of-n'
             actor_num_samples=32,       # for actor_type='best-of-n' only
             use_fourier_features=False,
             fourier_feature_dim=64,
